@@ -1,0 +1,147 @@
+Map.addLayer(BBMP, { palette: 'ffffff'}, 'BBMP boundary', 0);
+Map.centerObject(BBMP, 11);
+
+////////////DATA SELECTION FROM DATASET///////////////
+
+// Applies scaling factors
+function applyScaleFactors(image) {
+  var opticalBands = image.select('SR_B.').multiply(0.0000275).add(-0.2);
+  var thermalBands = image.select('ST_B.*').multiply(0.00341802).add(149.0);
+  return image.addBands(opticalBands, null, true) 
+              .addBands(thermalBands, null, true)}
+
+//Data filter
+var data = ee.ImageCollection('LANDSAT/LC09/C02/T1_L2')
+    .filterDate('2023-01-15', '2023-03-28')
+    .filterMetadata('CLOUD_COVER', 'less_than', 0.5)
+    .filterBounds(BBMP)
+    .map(applyScaleFactors)
+    .first();
+print(data);
+
+//CLip to roi
+var image = data.clip(BBMP);
+
+//FCC Vizualization
+Map.addLayer(image, {bands: ['SR_B5', 'SR_B4', 'SR_B3'], 
+                      min: 0.05, max: 0.28, gamma: 1.4,}, 
+                      'image_FCC');
+
+//////////////////LAND COVER CLASSIFICATION///////////////////////////////
+
+// Compute the Normalized Difference Vegetation Index (NDVI).
+var nir = image.select('SR_B5');
+var red = image.select('SR_B4');
+
+var NDVI = nir.subtract(red).divide(nir.add(red)).rename('NDVI');
+
+var NDVIParams = {min: -1, max: 1, 
+                  palette: ['blue', 'white', 'green']};
+
+Map.addLayer(NDVI, NDVIParams, 'NDVI', 0);
+
+
+Export.image.toDrive({
+  image: NDVI, 
+  description:'BBMP_NDVI', 
+  folder:"GEE", 
+  crs: 'EPSG:32643', 
+  region: BBMP, 
+  scale: 30,
+  fileFormat : 'GeoTIFF',
+  maxPixels: 1e12});
+  
+/////////////////////LAND USE CLASSIFICATION////////////////////////////////////
+
+//Select Bands from Image for training
+var bands = ['SR_B2', 'SR_B3', 'SR_B4', 'SR_B5', 'SR_B6', 'SR_B7'];
+
+//Merge training polygons into one FeatureCollection
+var lulc_features = builtup
+                    .merge(vegetation)
+                    .merge(water)
+                    .merge(other);
+print(lulc_features);
+
+//Sample the input imagery to get a FeatureCollection of training data
+var training = image.select(bands).sampleRegions({
+  collection: lulc_features,
+  properties: ['lulc'],
+  scale: 30});
+
+//training data distribution
+//random selection of training polygons
+var withRandom = training.randomColumn('random');
+var split = 0.7; // 70% training, 30% testing.
+
+var trainingPartition = withRandom.filter(ee.Filter.lt('random', split));
+var testingPartition = withRandom.filter(ee.Filter.gte('random', split));
+
+//Train the classifier
+var classifier = ee.Classifier.smileRandomForest(100).train({
+  features: trainingPartition,
+  classProperty: 'lulc' ,
+  inputProperties: bands});
+
+//Classify the input imagery
+var classified = image.classify(classifier);
+
+//Define color palette
+var LU_palette = [
+  'ff0000', //builtup     (1) // red
+  '00ff00', //vegetation (2) // Green
+  '0000ff', //water      (3) // blue
+  'ffff00', //others     (4) // yellow
+];
+
+//Display the classified result 
+Map.addLayer(classified, {min:1, max: 4, palette: LU_palette}, 'BBMP_LU', 0);
+
+//export classified map to google drive
+ Export.image.toDrive({
+   image: classified,
+   description: 'BBMP_LU',
+   folder: "GEE",
+   crs: 'EPSG:32643',
+   region: BBMP,
+   scale: 30,
+   maxPixels: 1e12,
+ });
+ 
+// Accuracy assessment
+
+var accuracyClassifier = ee.Classifier.smileRandomForest(100).train({
+  features: testingPartition,
+  classProperty: 'lulc',
+  inputProperties: bands
+});
+
+//classify the test FeatureCollection.
+var test = testingPartition.classify(accuracyClassifier);
+
+// Calculate Confusion Matrix.
+var confusionMatrix = test.errorMatrix('lulc', 'classification');
+print('Confusion Matrix', confusionMatrix);
+
+// Calculate overall accuracy.
+var OA = confusionMatrix.accuracy();
+print("Overall accuracy", OA ); 
+
+// Calculate consumer's accuracy, also known as user's accuracy or
+// specificity and the complement of commission error (1 − commission error).
+print("Consumer's accuracy", confusionMatrix.consumersAccuracy());
+
+// Calculate producer's accuracy, also known as sensitivity and the
+// compliment of omission error (1 − omission error).
+print("Producer's accuracy", confusionMatrix.producersAccuracy());
+
+// Calculate kappa statistic.
+var Kappa = confusionMatrix.kappa();
+print('Kappa statistic', Kappa );
+
+//calculating area for each class (of classified)
+var classes_area = ee.Image.pixelArea().addBands(classified).divide(1e6).reduceRegion({
+                   reducer: ee.Reducer.sum().group(1), geometry: BBMP, scale: 8, bestEffort: true });
+print("All Classes Area in Square KM", classes_area);
+
+
